@@ -12,3 +12,6 @@ duckduckgo-search>=6.0.0
 
 # Web UI & Visualization
 streamlit>=1.35.0
+
+# Compatibility constraints
+starlette>=0.37.2,<0.38.0

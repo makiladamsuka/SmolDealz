@@ -1,0 +1,25 @@
+# Virtual Environment
+.venv/
+venv/
+ENV/
+
+# Environment Variables
+.env
+
+# Python Cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+
+# Playwright & Data Artifacts
+data/screenshots/*.png
+!data/screenshots/.gitkeep
+data/price_history.db
+
+# IDE & OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

@@ -10,6 +10,13 @@ class UserIntent(BaseModel):
     specs: dict[str, str] = Field(default_factory=dict, description="Key specifications like brand, model, color")
 
 
+class DiscoveredStore(BaseModel):
+    name: str = Field(description="Store brand name, e.g. 'Tronic.lk'")
+    url: str = Field(description="Base URL of the store homepage, e.g. 'https://tronic.lk'")
+    reason: Optional[str] = Field(default=None, description="Why this store matches the product & region")
+    search_url_template: Optional[str] = Field(default=None, description="Direct search URL template if known")
+
+
 class ProductOffer(BaseModel):
     store: str = Field(description="Store identifier or domain, e.g. 'tronic.lk', 'maker.lk'")
     title: str = Field(description="Exact product title listed on the store website")

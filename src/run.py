@@ -25,13 +25,17 @@ def run(user_input: str):
     print(f"      ✅ intent = {artifacts['intent']}")
 
     # ── 2. Find items ─────────────────────────────────────────
-    item = artifacts["intent"].get("item", user_input)
-    print(f"\n[2/3] ItemFinderAgent ← item='{item}'")
+    intent = artifacts.get("intent")
+    item = intent.item if hasattr(intent, "item") else getattr(intent, "get", lambda k, d: user_input)("item", user_input)
+    region = intent.region if hasattr(intent, "region") else "Sri Lanka"
+    print(f"\n[2/3] ItemFinderAgent ← item='{item}', region='{region}'")
     item_agent.run(
-        f"Search all regional stores for '{item}'. "
-        "First call get_stores_to_search, then call search_store for each store."
+        f"Find product listings and prices for '{item}' in '{region}'. "
+        "First call discover_stores, then search each store using the tiered protocol, "
+        "inspect product details, and save verified offers using save_product_offer."
     )
-    print(f"      ✅ offers = {artifacts['offers']}")
+    print(f"      ✅ stores = {[s.name for s in artifacts.get('stores', [])]}")
+    print(f"      ✅ offers count = {len(artifacts.get('offers', []))}")
 
     # ── 3. Evaluate ───────────────────────────────────────────
     qty = artifacts["intent"].get("quantity", 1)

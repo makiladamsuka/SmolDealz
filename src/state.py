@@ -1,6 +1,6 @@
 artifacts = {
-    "intent":    {},   # filled by IntentFinderAgent
-    "offers":    [],   # filled by ItemFinderAgent
-    "best_deal": {},   # filled by EvaluationAgent
+    "intent":    {},   # UserIntent
+    "stores":    [],   # List[DiscoveredStore]
+    "offers":    [],   # List[ProductOffer]
+    "best_deal": {},   # BestDeal
 }
-

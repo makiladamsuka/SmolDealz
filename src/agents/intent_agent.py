@@ -2,11 +2,26 @@
 #  AGENT 1 — IntentFinderAgent
 #  Job: turn messy user text → clean intent dict
 # ══════════════════════════════════════════════
+import os
+from typing import Callable
 from src.agents.model import model
 from src.state import artifacts
 from src.schemas import UserIntent
 from smolagents import tool, ToolCallingAgent
 from pydantic import ValidationError
+
+_clarification_handler: Callable[[str], str] | None = None
+_interactive_clarification: bool = os.getenv("SMOLDEALZ_NON_INTERACTIVE", "").lower() not in {"1", "true", "yes"}
+
+
+def set_clarification_mode(
+    interactive: bool = True,
+    handler: Callable[[str], str] | None = None,
+) -> None:
+    """Configure how ask_clarification obtains answers (CLI input, callback, or disabled)."""
+    global _interactive_clarification, _clarification_handler
+    _interactive_clarification = interactive
+    _clarification_handler = handler
 
 instructions="""
 You are an expert e-commerce hardware & electronics shopping intent parser.
@@ -34,7 +49,8 @@ Follow these universal rules:
    - If the user names a recognizable product or part number, do NOT ask extra questions — use standard defaults (quantity=1, budget=None, region='Sri Lanka').
 
 4. COMPLETION:
-   - Immediately call 'save_intent' once the item name is normalized, then call 'final_answer'.
+   - Only pass 'budget' if the user explicitly stated a price limit; otherwise omit it (never pass 0 or 1 as a placeholder).
+   - Call 'save_intent' ONCE, then immediately call 'final_answer' on the next step (do NOT call 'save_intent' again).
 """
 
 @tool
@@ -49,7 +65,7 @@ def save_intent(
     Args:
         item:     The product name the user wants (e.g. 'mg90 servo').
         quantity: How many units they need (default: 1).
-        budget:   Maximum total price in LKR if specified (optional).
+        budget:   Maximum total price in LKR ONLY if explicitly stated by the user; otherwise omit (None). Never guess 1.
         region:   Where to buy from (default: 'Sri Lanka').
     """
     try:
@@ -61,7 +77,10 @@ def save_intent(
             region=region
         )
         artifacts["intent"] = intent
-        return f"SUCCESS: Intent validated and stored: {intent.model_dump()}"
+        return (
+            f"SUCCESS: Intent validated and stored: {intent.model_dump()}. "
+            "Do NOT call save_intent again — immediately call final_answer now."
+        )
     except ValidationError as e:
         return f"VALIDATION ERROR: Please fix parameters: {e}"
 
@@ -72,6 +91,14 @@ def ask_clarification(question: str) -> str:
     Args:
         question: The question to ask the user (e.g. 'Did you mean mg90 or sg90?').
     """
+    if _clarification_handler is not None:
+        user_response = _clarification_handler(question).strip()
+        return f"User answered: '{user_response}'"
+    if not _interactive_clarification:
+        return (
+            "Interactive clarification is disabled. "
+            "Proceed using reasonable defaults and call save_intent."
+        )
     print(f"\n❓ [Agent Question]: {question}")
     user_response = input("👉 Your answer: ").strip()
     return f"User answered: '{user_response}'"

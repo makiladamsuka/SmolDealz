@@ -3,8 +3,11 @@
 #  Job: discover stores, run tiered search, save offers
 # ══════════════════════════════════════════════
 
+import atexit
+from contextlib import contextmanager
 import json
 import re
+import threading
 from urllib.parse import quote_plus, urlparse
 from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright
@@ -18,20 +21,65 @@ from src.state import artifacts
 from src.schemas import DiscoveredStore, ProductOffer
 from src.stores import save_discovered_store, get_all_stores
 
+_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+_thread_local = threading.local()
+
+
+def close_browser() -> None:
+    """Close the current thread's Playwright browser session if open."""
+    browser = getattr(_thread_local, "browser", None)
+    pw = getattr(_thread_local, "pw", None)
+    if browser is not None:
+        try:
+            browser.close()
+        except Exception:
+            pass
+        _thread_local.browser = None
+    if pw is not None:
+        try:
+            pw.stop()
+        except Exception:
+            pass
+        _thread_local.pw = None
+
+
+atexit.register(close_browser)
+
+
+@contextmanager
+def _browser_page():
+    """Yield a fresh Playwright page from a thread-local Chromium browser instance."""
+    if getattr(_thread_local, "pw", None) is None:
+        _thread_local.pw = sync_playwright().start()
+    browser = getattr(_thread_local, "browser", None)
+    if browser is None or not browser.is_connected():
+        browser = _thread_local.pw.chromium.launch(headless=True)
+        _thread_local.browser = browser
+
+    context = browser.new_context(user_agent=_USER_AGENT)
+    page = context.new_page()
+    try:
+        yield page
+    finally:
+        try:
+            context.close()
+        except Exception:
+            pass
+
 
 # =====================================================================
 # 1. STORE DISCOVERY LOGIC (LLM + Search Engine Fallback)
 # =====================================================================
 
-def _discover_stores_via_llm(item: str, region: str = "Sri Lanka", count: int = 3) -> list[dict]:
-    """Uses LLM domain knowledge to find authentic retail stores for any product & region."""
-    prompt = f"""You are an expert global e-commerce and retail procurement scout.
-Identify {count} real, authentic online consumer e-commerce stores operating in '{region}' that sell '{item}' or products in that category.
+def _discover_stores_via_llm(item: str, region: str = "Sri Lanka", count: int = 4) -> list[dict]:
+    """Uses LLM domain knowledge to find specialized retail stores for any product & region."""
+    prompt = f"""You are an expert global e-commerce and hardware/retail procurement scout.
+Identify {count} real, authentic online consumer e-commerce stores operating in '{region}' that specialize in selling '{item}' or its exact product category.
 
 Rules:
-1. Only return genuine retail e-commerce stores that sell to consumers and have an active product search/catalog in '{region}'.
-2. The stores must be relevant to the specific product category of '{item}' (e.g., tech gadgets, electronics, hardware, general retail marketplaces).
-3. Do NOT return corporate telecom ISP portals (like slt.lk), gift hamper services, or government sites.
+1. Prioritize SPECIALIZED category retailers (e.g., for sensors, microcontrollers, servos, or DIY hardware: dedicated electronics/robotics component stores in '{region}', NOT generic supermarkets, grocery stores, gift portals, or classifieds).
+2. Only return genuine online stores with an active product catalog/search in '{region}' (you may include at most 1 major general marketplace like Daraz if relevant, but lead with specialist stores).
+3. Do NOT return supermarkets (like cargills, keells), telecom ISP portals (like slt.lk), gift hamper services (like kapruka), classifieds (like ikman), or government sites.
 4. Return ONLY a valid JSON list of objects with no markdown formatting:
    - "name": Store brand name
    - "url": Base homepage URL (e.g. "https://store-domain.com")
@@ -202,26 +250,62 @@ def _clean_numeric_price(price_raw: str) -> float:
     return 0.0
 
 
+def _default_currency() -> str:
+    """Return currency from artifacts['intent'] if set, otherwise 'LKR'."""
+    intent = artifacts.get("intent")
+    if hasattr(intent, "currency") and intent.currency:
+        return intent.currency
+    if isinstance(intent, dict) and intent.get("currency"):
+        return intent["currency"]
+    return "LKR"
+
+
+def _infer_currency(price_raw: str) -> str:
+    """Infer ISO currency code from a scraped price string, falling back to intent currency."""
+    text = (price_raw or "").upper()
+    if "LKR" in text or "RS" in text or "රු" in text:
+        return "LKR"
+    if "USD" in text or "$" in text:
+        return "USD"
+    if "EUR" in text or "€" in text:
+        return "EUR"
+    if "GBP" in text or "£" in text:
+        return "GBP"
+    if "INR" in text or "₹" in text:
+        return "INR"
+    return _default_currency()
+
+
 # =====================================================================
 # 3. SMOLAGENTS TOOLS: DISCOVERY + 3 TIERS + INSPECTION + SAVE
 # =====================================================================
 
 @tool
 def discover_stores(item: str, region: str = "Sri Lanka") -> str:
-    """Discover at least 3 authentic online stores that sell this item in the given region.
-    Saves the discovered stores into the pipeline blackboard and registry.
+    """Discover specialized online stores that sell this item in the given region.
+    Combines LLM domain knowledge with live web search and saves stores to the blackboard.
 
     Args:
         item: The product name (e.g. 'ESP32 development board', 'MG90S servo').
         region: The geographical shopping region (default: 'Sri Lanka').
     """
-    stores_data = _discover_stores_via_llm(item, region, count=3)
-    if len(stores_data) < 3:
-        search_stores = _discover_stores_via_search(item, region, count=3)
-        existing = {s["url"].rstrip("/").lower() for s in stores_data}
-        for s in search_stores:
-            if s["url"].rstrip("/").lower() not in existing:
-                stores_data.append(s)
+    llm_stores = _discover_stores_via_llm(item, region, count=4)
+    search_stores = _discover_stores_via_search(item, region, count=4)
+
+    stores_data = []
+    seen_domains = set()
+    for s in llm_stores + search_stores:
+        url = (s.get("url") or "").strip()
+        if not url:
+            continue
+        domain = urlparse(url).netloc.lower()
+        if domain.startswith("www."):
+            domain = domain[4:]
+        if domain and domain not in seen_domains:
+            seen_domains.add(domain)
+            stores_data.append(s)
+        if len(stores_data) >= 5:
+            break
 
     discovered_models = []
     for s in stores_data:
@@ -251,11 +335,7 @@ def search_tier1_direct_url(store_url: str, search_query: str) -> str:
         store_url: Base store URL (e.g. 'https://tronic.lk', 'https://maker.lk').
         search_query: Search keywords (e.g. 'ESP32', 'MG90S').
     """
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-        )
+    with _browser_page() as page:
         try:
             # Check if a custom search_url_template was discovered for this store
             target_url = None
@@ -291,8 +371,6 @@ def search_tier1_direct_url(store_url: str, search_query: str) -> str:
                 "status": "ERROR",
                 "error": f"{type(e).__name__}: store search failed",
             })
-        finally:
-            browser.close()
 
 
 @tool
@@ -303,11 +381,7 @@ def search_tier2_onsite_search_bar(store_url: str, search_query: str) -> str:
         store_url: Base store URL (e.g. 'https://tronic.lk', 'https://maker.lk').
         search_query: Keywords to type into the search bar.
     """
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-        )
+    with _browser_page() as page:
         try:
             page.goto(store_url, timeout=25000, wait_until="domcontentloaded")
             search_selectors = [
@@ -357,8 +431,6 @@ def search_tier2_onsite_search_bar(store_url: str, search_query: str) -> str:
                 "status": "ERROR",
                 "error": f"{type(e).__name__}: search bar input failed",
             })
-        finally:
-            browser.close()
 
 
 @tool
@@ -369,11 +441,7 @@ def search_tier3_web_search(store_domain: str, search_query: str) -> str:
         store_domain: Domain name of the store (e.g. 'tronic.lk', 'maker.lk').
         search_query: Search keywords (e.g. 'ESP32 development board').
     """
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-        )
+    with _browser_page() as page:
         try:
             ddg_url = f"https://html.duckduckgo.com/html/?q={quote_plus(f'{store_domain} {search_query}')}"
             page.goto(ddg_url, timeout=20000, wait_until="domcontentloaded")
@@ -396,8 +464,6 @@ def search_tier3_web_search(store_domain: str, search_query: str) -> str:
                 "status": "ERROR",
                 "error": f"{type(e).__name__}: search failed",
             })
-        finally:
-            browser.close()
 
 
 @tool
@@ -408,13 +474,16 @@ def inspect_product_details(product_url: str, store_name: str = "") -> str:
         product_url: Exact URL of the product to inspect.
         store_name: Name of the store (e.g. 'Tronic.lk', 'Daraz.lk').
     """
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-        )
+    with _browser_page() as page:
         try:
             page.goto(product_url, timeout=25000, wait_until="domcontentloaded")
+            try:
+                page.wait_for_selector(
+                    ".pdp-price, .pdp-v2-product-price, .woocommerce-Price-amount, .price .amount, .product__price, [class*='price']",
+                    timeout=5000,
+                )
+            except Exception:
+                pass
             title = page.title()
 
             # 1. Try CSS Selectors (Daraz, WooCommerce, Shopify, etc.)
@@ -431,32 +500,72 @@ def inspect_product_details(product_url: str, store_name: str = "") -> str:
                         price_raw = txt
                         break
 
-            # 2. Universal HTML regex fallback (covers SPAs like Daraz where price is in content/state)
+            # 2. Visible-text regex fallback (avoids matching $1/USD inside raw <script>/JSON)
             numeric_price = _clean_numeric_price(price_raw)
             if numeric_price == 0.0:
-                html = page.content()
-                matches = re.findall(r"(?:Rs\.?|LKR)\s*[\d,]+(?:\.\d+)?", html, re.IGNORECASE)
+                try:
+                    visible_text = page.inner_text("body")
+                except Exception:
+                    visible_text = ""
+                matches = re.findall(
+                    r"(?:Rs\.?|LKR|රු\.?)\s*[\d,]+(?:\.\d+)?|(?:\$|USD|EUR|€|GBP|£)\s*[\d,]+(?:\.\d+)?",
+                    visible_text,
+                    re.IGNORECASE,
+                )
                 if matches:
                     price_raw = matches[0]
                     numeric_price = _clean_numeric_price(price_raw)
 
-            # Stock extraction heuristics
+            currency = _infer_currency(price_raw)
+
+            # Stock extraction heuristics (status + numeric quantity if shown)
             stock_raw = "In Stock"
             stock_loc = page.locator(
-                ".stock, .availability, [class*='stock'], :text-matches('In Stock|Out of Stock', 'i')"
+                ".stock, .availability, [class*='stock'], :text-matches('In Stock|Out of Stock|available|left', 'i')"
             ).first
             if stock_loc.count() > 0:
                 stock_raw = stock_loc.inner_text().strip()
 
-            is_in_stock = "out of stock" not in stock_raw.lower()
+            is_in_stock = "out of stock" not in stock_raw.lower() and "sold out" not in stock_raw.lower()
+            stock_quantity = None
+            if is_in_stock:
+                qty_match = re.search(r"(\d+)\s*(?:in stock|available|left|units?|pcs?)", stock_raw, re.IGNORECASE)
+                if not qty_match:
+                    qty_match = re.search(r"^\s*(\d+)\s*$", stock_raw)
+                if qty_match:
+                    stock_quantity = int(qty_match.group(1))
+
+            # Snippet / short description extraction
+            snippet = None
+            for desc_sel in [
+                ".woocommerce-product-details__short-description",
+                ".product-short-description",
+                "[class*='short-description']",
+                ".pdp-product-desc",
+                ".product-description",
+            ]:
+                dloc = page.locator(desc_sel).first
+                if dloc.count() > 0:
+                    dtxt = re.sub(r"\s+", " ", dloc.inner_text()).strip()
+                    if len(dtxt) > 10:
+                        snippet = dtxt[:250]
+                        break
+            if not snippet:
+                meta_desc = page.locator("meta[name='description']").first
+                if meta_desc.count() > 0:
+                    content_attr = (meta_desc.get_attribute("content") or "").strip()
+                    if content_attr:
+                        snippet = re.sub(r"\s+", " ", content_attr)[:250]
 
             result = {
                 "store": store_name or urlparse(product_url).netloc,
                 "title": title,
                 "price": numeric_price,
-                "currency": "LKR",
+                "currency": currency,
                 "in_stock": is_in_stock,
-                "url": product_url
+                "stock_quantity": stock_quantity,
+                "snippet": snippet,
+                "url": product_url,
             }
             return json.dumps(result, indent=2)
         except Exception as e:
@@ -464,8 +573,6 @@ def inspect_product_details(product_url: str, store_name: str = "") -> str:
                 "store": store_name,
                 "error": f"Failed to inspect page: {type(e).__name__}"
             })
-        finally:
-            browser.close()
 
 
 @tool
@@ -474,6 +581,7 @@ def save_product_offer(
     title: str,
     price: float,
     url: str,
+    currency: str | None = None,
     in_stock: bool = True,
     stock_quantity: int | None = None,
     snippet: str | None = None,
@@ -486,22 +594,33 @@ def save_product_offer(
         title: Exact product title from the store.
         price: Unit price as a number/float in local currency.
         url: Direct product link.
+        currency: ISO currency code (e.g. 'LKR', 'USD'). Defaults to intent currency.
         in_stock: True if available for purchase, False if out of stock.
         stock_quantity: Exact stock quantity count if known, otherwise None.
         snippet: Key specifications or description snippet.
         matched_item: The search term this offer satisfies (e.g. 'ESP32 development board').
     """
     try:
+        # Guard against LLM converting null stock_quantity into 0 when in_stock=True
+        normalized_stock_qty = None if (in_stock and stock_quantity == 0) else stock_quantity
         offer = ProductOffer(
             store=store,
             title=title,
             price=price,
+            currency=currency or _default_currency(),
             in_stock=in_stock,
-            stock_quantity=stock_quantity,
+            stock_quantity=normalized_stock_qty,
             url=url,
             snippet=snippet,
-            matched_item=matched_item
+            matched_item=matched_item,
         )
+        norm_key = (offer.store.strip().lower(), offer.url.strip().rstrip("/"))
+        for i, existing in enumerate(artifacts["offers"]):
+            existing_key = (existing.store.strip().lower(), existing.url.strip().rstrip("/"))
+            if existing_key == norm_key:
+                artifacts["offers"][i] = offer
+                return f"SUCCESS: Updated existing offer on blackboard artifacts['offers']: {offer.model_dump()}"
+
         artifacts["offers"].append(offer)
         return f"SUCCESS: Saved offer to blackboard artifacts['offers']: {offer.model_dump()}"
     except Exception as e:

@@ -10,6 +10,7 @@ import re
 import threading
 from urllib.parse import quote_plus, urlparse
 from dotenv import load_dotenv
+import httpx
 from playwright.sync_api import sync_playwright
 from smolagents import tool, ToolCallingAgent
 from duckduckgo_search import DDGS
@@ -119,10 +120,12 @@ Rules:
 
 def _discover_stores_via_search(item: str, region: str = "Sri Lanka", count: int = 3) -> list[dict]:
     """Uses DuckDuckGo search to discover store domains directly from the web."""
-    query = f"buy {item} online store {region}"
+    query = f'"{item}" price {region}'
     excluded = {
         "youtube.com", "facebook.com", "reddit.com", "wikipedia.org",
-        "github.com", "medium.com", "linkedin.com", "quora.com", "instagram.com"
+        "github.com", "medium.com", "linkedin.com", "quora.com", "instagram.com",
+        "pinterest.com", "dictionary.cambridge.org", "merriam-webster.com",
+        "wiktionary.org", "britannica.com",
     }
     discovered = []
     seen_domains = set()
@@ -152,6 +155,22 @@ def _discover_stores_via_search(item: str, region: str = "Sri Lanka", count: int
         print(f"⚠️  Search Discovery failed: {e}")
 
     return discovered
+
+
+def _is_store_reachable(url: str) -> bool:
+    """Quickly verify a candidate store homepage resolves and responds over HTTP(S)."""
+    try:
+        with httpx.Client(
+            timeout=5.0,
+            follow_redirects=True,
+            headers={"User-Agent": _USER_AGENT},
+        ) as client:
+            resp = client.head(url)
+            if resp.status_code in (405, 403):
+                resp = client.get(url)
+            return resp.status_code < 500
+    except Exception:
+        return False
 
 
 # =====================================================================
@@ -303,8 +322,10 @@ def discover_stores(item: str, region: str = "Sri Lanka") -> str:
             domain = domain[4:]
         if domain and domain not in seen_domains:
             seen_domains.add(domain)
+            if not _is_store_reachable(url):
+                continue
             stores_data.append(s)
-        if len(stores_data) >= 5:
+        if len(stores_data) >= 4:
             break
 
     discovered_models = []
@@ -366,6 +387,17 @@ def search_tier1_direct_url(store_url: str, search_query: str) -> str:
             }
             return json.dumps(result, indent=2)
         except Exception as e:
+            err_msg = str(e)
+            if any(
+                sig in err_msg
+                for sig in ("ERR_NAME_NOT_RESOLVED", "ERR_CONNECTION_REFUSED", "ERR_CONNECTION_TIMED_OUT", "Timeout")
+            ):
+                return json.dumps({
+                    "tier": "Tier 1: Direct URL",
+                    "status": "UNREACHABLE",
+                    "error": f"{type(e).__name__}: store is unreachable",
+                    "action_advice": "Store URL is unreachable. STOP — do NOT call Tier 2 or Tier 3 for this store; move to the next store.",
+                })
             return json.dumps({
                 "tier": "Tier 1: Direct URL",
                 "status": "ERROR",
@@ -466,6 +498,59 @@ def search_tier3_web_search(store_domain: str, search_query: str) -> str:
             })
 
 
+def _extract_structured_price(page) -> tuple[float, str | None]:
+    """Extract (price, currency) from JSON-LD Product/Offer or meta price tags."""
+    try:
+        scripts = page.locator("script[type='application/ld+json']").all_inner_texts()
+        for raw in scripts:
+            try:
+                data = json.loads(raw)
+            except Exception:
+                continue
+            nodes = data if isinstance(data, list) else [data]
+            for node in nodes:
+                if not isinstance(node, dict):
+                    continue
+                if "@graph" in node and isinstance(node["@graph"], list):
+                    nodes.extend(node["@graph"])
+                    continue
+                offers = node.get("offers")
+                if not offers:
+                    continue
+                offer_list = offers if isinstance(offers, list) else [offers]
+                for off in offer_list:
+                    if not isinstance(off, dict):
+                        continue
+                    raw_val = off.get("price") or off.get("lowPrice")
+                    if raw_val is not None:
+                        val = _clean_numeric_price(str(raw_val))
+                        if val > 0:
+                            curr = off.get("priceCurrency")
+                            return val, (str(curr).upper() if curr else None)
+    except Exception:
+        pass
+
+    for meta_sel in [
+        "meta[property='product:price:amount']",
+        "meta[property='og:price:amount']",
+        "meta[itemprop='price']",
+    ]:
+        try:
+            loc = page.locator(meta_sel).first
+            if loc.count() > 0:
+                val = _clean_numeric_price(loc.get_attribute("content") or "")
+                if val > 0:
+                    curr_loc = page.locator(
+                        "meta[property='product:price:currency'], meta[property='og:price:currency'], meta[itemprop='priceCurrency']"
+                    ).first
+                    curr = curr_loc.get_attribute("content") if curr_loc.count() > 0 else None
+                    return val, (str(curr).upper() if curr else None)
+        except Exception:
+            pass
+
+    return 0.0, None
+
+
 @tool
 def inspect_product_details(product_url: str, store_name: str = "") -> str:
     """Dig Deep: Navigates to a specific product page URL to extract full specifications, price, stock status, and description.
@@ -500,8 +585,14 @@ def inspect_product_details(product_url: str, store_name: str = "") -> str:
                         price_raw = txt
                         break
 
-            # 2. Visible-text regex fallback (avoids matching $1/USD inside raw <script>/JSON)
             numeric_price = _clean_numeric_price(price_raw)
+            structured_currency = None
+
+            # 2. Structured JSON-LD / meta price fallback (reliable on SPAs & multi-variant pages)
+            if numeric_price == 0.0:
+                numeric_price, structured_currency = _extract_structured_price(page)
+
+            # 3. Visible-text regex fallback (avoids matching $1/USD inside raw <script>/JSON)
             if numeric_price == 0.0:
                 try:
                     visible_text = page.inner_text("body")
@@ -516,7 +607,7 @@ def inspect_product_details(product_url: str, store_name: str = "") -> str:
                     price_raw = matches[0]
                     numeric_price = _clean_numeric_price(price_raw)
 
-            currency = _infer_currency(price_raw)
+            currency = structured_currency or _infer_currency(price_raw)
 
             # Stock extraction heuristics (status + numeric quantity if shown)
             stock_raw = "In Stock"

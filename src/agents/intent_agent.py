@@ -50,7 +50,7 @@ Follow these universal rules:
 
 4. COMPLETION:
    - Only pass 'budget' if the user explicitly stated a price limit; otherwise omit it (never pass 0 or 1 as a placeholder).
-   - Call 'save_intent' ONCE, then immediately call 'final_answer' on the next step (do NOT call 'save_intent' again).
+   - Call 'save_intent' ONCE, then immediately call 'final_answer' EXACTLY ONCE on the next step (do NOT call 'save_intent' again, and NEVER call 'final_answer' multiple times in one step).
 """
 
 @tool
@@ -69,6 +69,9 @@ def save_intent(
         region:   Where to buy from (default: 'Sri Lanka').
     """
     try:
+        # Guard against small LLMs passing placeholder budget=0 or 1 when omitted
+        if budget is not None and budget <= 1:
+            budget = None
         # Pydantic validates types, ranges (e.g. quantity >= 1), and defaults
         intent = UserIntent(
             item=item,

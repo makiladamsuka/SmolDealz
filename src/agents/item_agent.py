@@ -20,7 +20,7 @@ load_dotenv()
 from src.agents.model import model
 from src.state import artifacts
 from src.schemas import DiscoveredStore, ProductOffer
-from src.stores import save_discovered_store, get_all_stores
+from src.stores import save_discovered_store, get_all_stores, get_seed_stores
 
 _USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 _thread_local = threading.local()
@@ -131,14 +131,22 @@ def _discover_stores_via_search(item: str, region: str = "Sri Lanka", count: int
     seen_domains = set()
 
     try:
+        keywords = [w.lower() for w in re.findall(r"\w+", item) if len(w) > 2]
         results = DDGS().text(query, max_results=12)
         for r in results:
             href = r.get("href", "")
             title = r.get("title", "")
+            body = r.get("body", "")
+            text_blob = f"{title} {body}".lower()
+            if keywords and not any(k in text_blob for k in keywords):
+                continue
+
             parsed = urlparse(href)
             domain = parsed.netloc.lower()
             if domain.startswith("www."):
                 domain = domain[4:]
+            if any(domain.startswith(p) for p in ("forum.", "support.", "answers.", "docs.")):
+                continue
 
             if domain and domain not in excluded and domain not in seen_domains:
                 seen_domains.add(domain)
@@ -302,42 +310,45 @@ def _infer_currency(price_raw: str) -> str:
 @tool
 def discover_stores(item: str, region: str = "Sri Lanka") -> str:
     """Discover specialized online stores that sell this item in the given region.
-    Combines LLM domain knowledge with live web search and saves stores to the blackboard.
+    Uses verified regional seed stores first, falling back to LLM + web search if needed.
 
     Args:
         item: The product name (e.g. 'ESP32 development board', 'MG90S servo').
         region: The geographical shopping region (default: 'Sri Lanka').
     """
-    llm_stores = _discover_stores_via_llm(item, region, count=4)
-    search_stores = _discover_stores_via_search(item, region, count=4)
-
-    stores_data = []
+    seed_stores = get_seed_stores(region)
+    discovered_models: list[DiscoveredStore] = []
     seen_domains = set()
-    for s in llm_stores + search_stores:
-        url = (s.get("url") or "").strip()
-        if not url:
-            continue
-        domain = urlparse(url).netloc.lower()
-        if domain.startswith("www."):
-            domain = domain[4:]
+
+    for s in seed_stores:
+        domain = urlparse(s.url).netloc.lower().removeprefix("www.")
         if domain and domain not in seen_domains:
             seen_domains.add(domain)
-            if not _is_store_reachable(url):
-                continue
-            stores_data.append(s)
-        if len(stores_data) >= 4:
-            break
+            discovered_models.append(s)
+            save_discovered_store(s)
 
-    discovered_models = []
-    for s in stores_data:
-        store_obj = DiscoveredStore(
-            name=s.get("name", "Store"),
-            url=s.get("url", ""),
-            reason=s.get("reason"),
-            search_url_template=s.get("search_url_template"),
-        )
-        discovered_models.append(store_obj)
-        save_discovered_store(store_obj)
+    if len(discovered_models) < 3:
+        llm_stores = _discover_stores_via_llm(item, region, count=4)
+        search_stores = _discover_stores_via_search(item, region, count=4)
+        for s in llm_stores + search_stores:
+            url = (s.get("url") or "").strip()
+            if not url:
+                continue
+            domain = urlparse(url).netloc.lower().removeprefix("www.")
+            if domain and domain not in seen_domains:
+                seen_domains.add(domain)
+                if not _is_store_reachable(url):
+                    continue
+                store_obj = DiscoveredStore(
+                    name=s.get("name", "Store"),
+                    url=url,
+                    reason=s.get("reason"),
+                    search_url_template=s.get("search_url_template"),
+                )
+                discovered_models.append(store_obj)
+                save_discovered_store(store_obj)
+            if len(discovered_models) >= 4:
+                break
 
     artifacts["stores"] = discovered_models
 

@@ -66,8 +66,8 @@ def run(user_input: str):
         print(f"\n[3/3] EvaluationAgent ← {len(offers)} offers, need qty={qty}{budget_note}")
         eval_agent.run(
             f"Evaluate the offers for '{item}' (quantity={qty}{budget_note}). "
-            "Call get_evaluation_context(), filter out invalid/irrelevant/out-of-stock offers, "
-            "and save the best deal with save_best_deal (or save_no_deal if none qualify)."
+            "Call get_sorted_offers(), verify the cheapest matching offer, "
+            "and call select_best_deal(offer_index=..., reasoning=...) (or save_no_deal if none qualify)."
         )
     print(f"      ✅ best_deal = {artifacts['best_deal']}")
 
@@ -97,7 +97,48 @@ def run(user_input: str):
     else:
         print("❌  No deal selected.")
 
+    _print_top_deals(offers, qty=qty, default_currency=currency, limit=5)
+
     return artifacts
+
+
+def _print_top_deals(offers: list, qty: int = 1, default_currency: str = "LKR", limit: int = 5) -> None:
+    """Print up to `limit` valid offers sorted by availability and price with clickable URLs."""
+    priced = []
+    for o in offers:
+        price = o.price if hasattr(o, "price") else o.get("price", 0.0)
+        if price <= 0:
+            continue
+        in_stock = o.in_stock if hasattr(o, "in_stock") else o.get("in_stock", True)
+        stock_qty = o.stock_quantity if hasattr(o, "stock_quantity") else o.get("stock_quantity")
+        priced.append({
+            "store": o.store if hasattr(o, "store") else o.get("store", ""),
+            "title": o.title if hasattr(o, "title") else o.get("title", ""),
+            "unit_price": price,
+            "total_price": round(price * qty, 2),
+            "currency": (o.currency if hasattr(o, "currency") else o.get("currency")) or default_currency,
+            "in_stock": in_stock,
+            "stock_qty": stock_qty,
+            "url": o.url if hasattr(o, "url") else o.get("url", ""),
+        })
+
+    if not priced:
+        return
+
+    priced.sort(key=lambda x: (not x["in_stock"], x["total_price"]))
+    top = priced[:limit]
+
+    print("\n" + "-" * 55)
+    print(f"📋  TOP {len(top)} DEALS SUMMARY (qty={qty})")
+    print("-" * 55)
+    for rank, d in enumerate(top, start=1):
+        stock_label = (
+            f"In Stock ({d['stock_qty']})" if d["in_stock"] and d["stock_qty"] is not None
+            else ("In Stock" if d["in_stock"] else "Out of Stock")
+        )
+        print(f"{rank}. [{d['store']}] {d['title']}")
+        print(f"   Price : {d['currency']} {d['unit_price']} each | Total: {d['currency']} {d['total_price']} | {stock_label}")
+        print(f"   Link  : {d['url']}")
 
 
 if __name__ == "__main__":

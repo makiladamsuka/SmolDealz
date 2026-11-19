@@ -1,63 +1,125 @@
 # ══════════════════════════════════════════════
 #  AGENT 3 — EvaluationAgent
-#  Job: filter offers, check qty/budget, save BestDeal
+#  Job: sort/filter offers in Python, pick best match
 # ══════════════════════════════════════════════
 from pydantic import ValidationError
-from smolagents import CodeAgent, tool
+from smolagents import ToolCallingAgent, tool
 
 from src.agents.model import model
 from src.schemas import BestDeal, UserIntent
 from src.state import artifacts
 
 
-@tool
-def get_evaluation_context() -> dict:
-    """Return the user's intent and all scraped offers as plain Python dicts."""
+def _intent_params() -> tuple[str, int, float | None, str]:
     intent = artifacts.get("intent")
-    intent_dict = intent.model_dump() if isinstance(intent, UserIntent) else (intent or {})
-
-    offers = []
-    for idx, offer in enumerate(artifacts.get("offers", [])):
-        offer_dict = offer.model_dump() if hasattr(offer, "model_dump") else dict(offer)
-        offer_dict["index"] = idx
-        offers.append(offer_dict)
-
-    return {"intent": intent_dict, "offers": offers}
+    if isinstance(intent, UserIntent):
+        return intent.item, intent.quantity, intent.max_budget, intent.currency
+    if isinstance(intent, dict):
+        return (
+            intent.get("item", "product"),
+            int(intent.get("quantity", 1)),
+            intent.get("max_budget"),
+            intent.get("currency", "LKR"),
+        )
+    return "product", 1, None, "LKR"
 
 
 @tool
-def save_best_deal(
-    matched_item: str,
-    store: str,
-    unit_price: float,
-    total_price: float,
-    url: str,
-    stock: int | str = "In Stock",
-    reasoning: str = "",
-) -> str:
-    """Validate and save the winning BestDeal to artifacts['best_deal'].
+def get_sorted_offers() -> str:
+    """Filter eligible offers (in stock, valid price, enough stock) and return them sorted cheapest-first.
+    No args needed — reads directly from artifacts['intent'] and artifacts['offers'].
+    """
+    item, qty, max_budget, currency = _intent_params()
+    offers = artifacts.get("offers", [])
+    if not offers:
+        return "No offers on blackboard. Call save_no_deal and then final_answer."
+
+    eligible = []
+    for idx, o in enumerate(offers):
+        price = o.price if hasattr(o, "price") else o.get("price", 0.0)
+        in_stock = o.in_stock if hasattr(o, "in_stock") else o.get("in_stock", True)
+        stock_qty = o.stock_quantity if hasattr(o, "stock_quantity") else o.get("stock_quantity")
+        if price <= 0 or not in_stock:
+            continue
+        if stock_qty is not None and stock_qty < qty:
+            continue
+
+        total_price = round(price * qty, 2)
+        within_budget = max_budget is None or total_price <= max_budget
+        eligible.append({
+            "offer_index": idx,
+            "store": o.store if hasattr(o, "store") else o.get("store", ""),
+            "title": o.title if hasattr(o, "title") else o.get("title", ""),
+            "unit_price": price,
+            "total_price": total_price,
+            "currency": o.currency if hasattr(o, "currency") else o.get("currency", currency),
+            "stock": stock_qty if stock_qty is not None else "In Stock",
+            "within_budget": within_budget,
+            "snippet": ((o.snippet if hasattr(o, "snippet") else o.get("snippet")) or "")[:120],
+        })
+
+    if not eligible:
+        return (
+            f"0 eligible offers for '{item}' (qty={qty}) after filtering out price<=0, "
+            "out-of-stock, or insufficient stock. Call save_no_deal and then final_answer."
+        )
+
+    # Sort: within-budget first, then lowest total_price
+    eligible.sort(key=lambda x: (not x["within_budget"], x["total_price"]))
+
+    budget_str = f"{max_budget} {currency}" if max_budget is not None else "None"
+    lines = [
+        f"Target: '{item}' | Qty: {qty} | Max Budget: {budget_str}",
+        "Sorted Candidates (cheapest first):",
+    ]
+    for c in eligible:
+        budget_flag = "OK" if c["within_budget"] else "OVER_BUDGET"
+        lines.append(
+            f"- offer_index={c['offer_index']} | {c['currency']} {c['total_price']} total "
+            f"({c['unit_price']} each) | [{budget_flag}] | Store: {c['store']} | "
+            f"Stock: {c['stock']} | Title: {c['title']} | Snippet: {c['snippet']}"
+        )
+    return "\n".join(lines)
+
+
+@tool
+def select_best_deal(offer_index: int, reasoning: str = "") -> str:
+    """Select the winning offer by its offer_index and save BestDeal to artifacts['best_deal'].
 
     Args:
-        matched_item: Product name evaluated.
-        store: Winning store name.
-        unit_price: Unit price in local currency.
-        total_price: Total price for the required quantity.
-        url: Direct product link.
-        stock: Exact stock count if known, or 'In Stock'.
-        reasoning: Why this deal was selected (price, stock, budget fit, relevance).
+        offer_index: The exact offer_index from get_sorted_offers().
+        reasoning: Short explanation of why this offer was chosen.
     """
+    offers = artifacts.get("offers", [])
+    if offer_index < 0 or offer_index >= len(offers):
+        return f"ERROR: offer_index={offer_index} out of range (0..{len(offers) - 1})."
+
+    item, qty, max_budget, _ = _intent_params()
+    o = offers[offer_index]
+    unit_price = o.price if hasattr(o, "price") else o["price"]
+    total_price = round(unit_price * qty, 2)
+    if max_budget is not None and total_price > max_budget:
+        return (
+            f"REJECTED: offer_index={offer_index} total_price={total_price} exceeds "
+            f"max_budget={max_budget}. Pick a cheaper within-budget offer or call save_no_deal."
+        )
+
+    stock_qty = o.stock_quantity if hasattr(o, "stock_quantity") else o.get("stock_quantity")
     try:
         deal = BestDeal(
-            matched_item=matched_item,
-            store=store,
+            matched_item=o.title if hasattr(o, "title") else o.get("title", item),
+            store=o.store if hasattr(o, "store") else o["store"],
             unit_price=unit_price,
             total_price=total_price,
-            stock=stock,
-            url=url,
+            stock=stock_qty if stock_qty is not None else "In Stock",
+            url=o.url if hasattr(o, "url") else o["url"],
             reasoning=reasoning or None,
         )
         artifacts["best_deal"] = deal
-        return f"SUCCESS: Saved BestDeal to artifacts['best_deal']: {deal.model_dump()}"
+        return (
+            f"SUCCESS: Saved BestDeal for offer_index={offer_index}. "
+            "Do NOT call select_best_deal again — immediately call final_answer now."
+        )
     except ValidationError as e:
         return f"VALIDATION ERROR: {e}"
 
@@ -70,32 +132,21 @@ def save_no_deal(reason: str) -> str:
         reason: Clear explanation (e.g. out of stock, over budget, no matching offers).
     """
     artifacts["best_deal"] = {"error": reason}
-    return f"Recorded no deal: {reason}"
+    return f"RECORDED NO DEAL: {reason}. Immediately call final_answer now."
 
 
-instructions = """You are an expert e-commerce deal evaluation agent.
-Your job is to pick the best valid deal from scraped offers on the blackboard.
-
-Follow these steps:
-1. Call `ctx = get_evaluation_context()` first to inspect `ctx["intent"]` and `ctx["offers"]`.
-2. Print `ctx["intent"]` and each offer's `index`, `store`, `title`, `price`, `currency`, `in_stock`, `stock_quantity`, and `snippet`.
-3. Filter out offers that:
-   - have `price <= 0`,
-   - have `in_stock` is False,
-   - have `stock_quantity` not None and `stock_quantity < quantity`,
-   - clearly do NOT match `intent["item"]` or `intent["specs"]` (e.g. accessories, cables, wrong model).
-4. For remaining eligible offers, compute `total_price = o["price"] * quantity`.
-   - If `intent.get("max_budget")` is set, prefer offers where `total_price <= max_budget`.
-   - If no eligible offer fits `max_budget`, call `save_no_deal(...)` explaining the cheapest eligible total vs the budget.
-5. Select the lowest `total_price` eligible offer and call `save_best_deal(...)` with `stock=o["stock_quantity"] if o["stock_quantity"] is not None else "In Stock"` and concise `reasoning`.
-6. Always wrap every Python step — including `final_answer("...")` — inside `<code>...</code>` tags.
+instructions = """You are an e-commerce deal evaluation agent.
+1. Call `get_sorted_offers()` first — it already filters out invalid/out-of-stock offers and sorts them cheapest-first.
+2. Inspect the top candidate(s): pick the FIRST (cheapest) `offer_index` that is `[OK]` (within budget) and whose `Title`/`Snippet` genuinely matches the target product (not an accessory, cable, or wrong model).
+3. Call `select_best_deal(offer_index=..., reasoning=...)` ONCE (or `save_no_deal(...)` if none qualify).
+4. On the next step, call `final_answer` EXACTLY ONCE with a brief summary.
 """
 
-eval_agent = CodeAgent(
-    tools=[get_evaluation_context, save_best_deal, save_no_deal],
+eval_agent = ToolCallingAgent(
+    tools=[get_sorted_offers, select_best_deal, save_no_deal],
     model=model,
     name="EvaluationAgent",
-    description="Reads artifacts['intent'] and artifacts['offers'], filters by relevance/stock/budget, and saves BestDeal.",
+    description="Sorts eligible offers by price, verifies product match, and saves BestDeal.",
     instructions=instructions,
     max_steps=4,
 )

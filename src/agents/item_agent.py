@@ -582,10 +582,12 @@ def inspect_product_details(product_url: str, store_name: str = "") -> str:
                 pass
             title = page.title()
 
-            # 1. Try CSS Selectors (Daraz, WooCommerce, Shopify, etc.)
+            # 1. Try CSS Selectors (Daraz, WooCommerce product summary, Shopify, etc.)
             price_raw = ""
+            numeric_price = 0.0
             for sel in [
                 ".pdp-price", ".pdp-price_type_normal", ".pdp-v2-product-price", "[class*='pdp-price']",
+                ".summary .price .amount", ".entry-summary .price .amount", "p.price .woocommerce-Price-amount",
                 ".woocommerce-Price-amount", ".price .amount", "p.price",
                 ".price-item--regular", ".product__price", ".price", ".product-price", "[class*='price']"
             ]:
@@ -593,10 +595,12 @@ def inspect_product_details(product_url: str, store_name: str = "") -> str:
                 if loc.count() > 0:
                     txt = loc.inner_text().strip()
                     if txt and any(c.isdigit() for c in txt):
-                        price_raw = txt
-                        break
+                        candidate_price = _clean_numeric_price(txt)
+                        if candidate_price > 0:
+                            price_raw = txt
+                            numeric_price = candidate_price
+                            break
 
-            numeric_price = _clean_numeric_price(price_raw)
             structured_currency = None
 
             # 2. Structured JSON-LD / meta price fallback (reliable on SPAs & multi-variant pages)

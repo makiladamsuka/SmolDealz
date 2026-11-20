@@ -308,14 +308,23 @@ def _infer_currency(price_raw: str) -> str:
 # =====================================================================
 
 @tool
-def discover_stores(item: str, region: str = "Sri Lanka") -> str:
+def discover_stores(item: str, region: str = "Sri Lanka", force_refresh: bool = False) -> str:
     """Discover specialized online stores that sell this item in the given region.
-    Uses verified regional seed stores first, falling back to LLM + web search if needed.
+    Reuses existing blackboard stores if already populated unless force_refresh=True.
 
     Args:
         item: The product name (e.g. 'ESP32 development board', 'MG90S servo').
         region: The geographical shopping region (default: 'Sri Lanka').
+        force_refresh: Set True only if switching region/category and existing stores must be replaced.
     """
+    existing_stores = artifacts.get("stores") or []
+    if existing_stores and not force_refresh:
+        summary = [{"name": s.name, "url": s.url, "reason": s.reason} for s in existing_stores]
+        return (
+            f"Reusing {len(existing_stores)} already-discovered stores on blackboard (skipped discovery):\n"
+            f"{json.dumps(summary, indent=2)}"
+        )
+
     seed_stores = get_seed_stores(region)
     discovered_models: list[DiscoveredStore] = []
     seen_domains = set()

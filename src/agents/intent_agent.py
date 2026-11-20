@@ -48,7 +48,11 @@ Follow these universal rules:
    - Only call 'ask_clarification' if a critical parameter is completely missing that prevents finding the item (e.g., "I need a capacitor" without capacitance/voltage, or "I need a stepper motor" without size/torque).
    - If the user names a recognizable product or part number, do NOT ask extra questions — use standard defaults (quantity=1, budget=None, region='Sri Lanka').
 
-4. COMPLETION:
+4. FOLLOW-UP REFINEMENTS:
+   - If a 'Previous intent:' is provided, treat the new message as an update to it: keep unchanged fields (e.g. region, quantity, budget, category, or item) unless the user overrides them.
+   - Set 'category' to the broad product domain (e.g. 'electronics', 'fashion', 'groceries', 'home', 'general').
+
+5. COMPLETION:
    - Only pass 'budget' if the user explicitly stated a price limit; otherwise omit it (never pass 0 or 1 as a placeholder).
    - Call 'save_intent' ONCE, then immediately call 'final_answer' EXACTLY ONCE on the next step (do NOT call 'save_intent' again, and NEVER call 'final_answer' multiple times in one step).
 """
@@ -58,7 +62,8 @@ def save_intent(
     item: str, 
     quantity: int = 1, 
     budget: float | None = None, 
-    region: str = "Sri Lanka"
+    region: str = "Sri Lanka",
+    category: str = "electronics",
 ) -> str:
     """Save the parsed user intent to the shared blackboard.
 
@@ -67,6 +72,7 @@ def save_intent(
         quantity: How many units they need (default: 1).
         budget:   Maximum total price in LKR ONLY if explicitly stated by the user; otherwise omit (None). Never guess 1.
         region:   Where to buy from (default: 'Sri Lanka').
+        category: Product domain/category (e.g. 'electronics', 'fashion', 'groceries', 'general').
     """
     try:
         # Guard against small LLMs passing placeholder budget=0 or 1 when omitted
@@ -77,7 +83,8 @@ def save_intent(
             item=item,
             quantity=quantity,
             max_budget=budget,
-            region=region
+            region=region,
+            category=category.strip().lower() or "electronics",
         )
         artifacts["intent"] = intent
         return (

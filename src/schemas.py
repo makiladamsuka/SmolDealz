@@ -7,6 +7,7 @@ class UserIntent(BaseModel):
     max_budget: Optional[float] = Field(default=None, ge=0, description="Max budget constraint, if specified")
     currency: str = Field(default="LKR", description="Currency code (e.g., 'LKR', 'USD')")
     region: str = Field(default="Sri Lanka", description="Target shopping region")
+    category: str = Field(default="electronics", description="Product category/domain (e.g. 'electronics', 'fashion', 'groceries', 'general')")
     specs: dict[str, str] = Field(default_factory=dict, description="Key specifications like brand, model, color")
 
 

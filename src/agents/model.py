@@ -10,6 +10,6 @@ litellm.suppress_debug_info = True
 litellm.set_verbose = False
 
 model = LiteLLMModel(
-    model_id=os.getenv("OPENROUTER_MODEL", "openrouter/nvidia/nemotron-3.5-lightning:free"),
+    model_id=os.getenv("OPENROUTER_MODEL", "openrouter/google/gemma-4-26b-a4b-it:free"),
     api_key=os.getenv("OPENROUTER_API_KEY"),
 )

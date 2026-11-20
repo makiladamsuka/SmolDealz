@@ -1,81 +1,43 @@
 """
-SmolDealz — Pipeline Entrypoint
-Run from project root:  uv run -m src.run  (or python -m src.run)
+SmolDealz — Continuous Chat Pipeline Entrypoint
+Run from project root:
+  uv run -m src.run                  (Python Diff-Router chat loop)
+  uv run -m src.run --orchestrator   (OrchestratorAgent chat loop)
 """
+import sys
 from dotenv import load_dotenv
 load_dotenv()
 
-from src.state import artifacts, reset_artifacts
+from src.state import artifacts, clear_offers, reset_artifacts
 from src.schemas import BestDeal, UserIntent
 from src.agents.intent_agent import intent_agent
 from src.agents.item_agent import item_agent, close_browser
 from src.agents.eval_agent import eval_agent
+from src.agents.orchestrator_agent import orchestrator_agent
 
 
-def run(user_input: str):
-    reset_artifacts()
+def _decide_route(old_intent: UserIntent | None, new_intent: UserIntent) -> str:
+    """Determine which pipeline stages to run based on what changed since the previous turn."""
+    if old_intent is None:
+        return "full_search"
 
-    print("\n" + "=" * 55)
-    print("🤖  SmolDealz Pipeline")
-    print("=" * 55)
+    same_region = old_intent.region.strip().lower() == new_intent.region.strip().lower()
+    same_category = old_intent.category.strip().lower() == new_intent.category.strip().lower()
+    same_item = old_intent.item.strip().lower() == new_intent.item.strip().lower()
 
-    # ── 1. Parse intent ───────────────────────────────────────
-    print(f"\n[1/3] IntentFinderAgent ← '{user_input}'")
-    intent_agent.run(
-        f"Parse this request and save the intent: '{user_input}'. "
-        "Ask a clarifying question first if anything is ambiguous, then call save_intent once."
-    )
-    intent = artifacts.get("intent")
-    print(f"      ✅ intent = {intent}")
+    if same_region and same_category and same_item and artifacts.get("offers"):
+        return "re_evaluate"
+    if same_region and same_category and artifacts.get("stores"):
+        return "search_same_stores"
+    return "full_search"
 
-    if isinstance(intent, UserIntent):
-        item = intent.item
-        region = intent.region
-        qty = intent.quantity
-        max_budget = intent.max_budget
-        currency = intent.currency
-    elif isinstance(intent, dict):
-        item = intent.get("item", user_input)
-        region = intent.get("region", "Sri Lanka")
-        qty = intent.get("quantity", 1)
-        max_budget = intent.get("max_budget")
-        currency = intent.get("currency", "LKR")
-    else:
-        item, region, qty, max_budget, currency = user_input, "Sri Lanka", 1, None, "LKR"
 
-    # ── 2. Find items ─────────────────────────────────────────
-    print(f"\n[2/3] ItemFinderAgent ← item='{item}', region='{region}'")
-    try:
-        item_agent.run(
-            f"Find product listings and prices for '{item}' in '{region}'. "
-            "First call discover_stores, then search each store using the tiered protocol, "
-            "inspect product details, and save verified offers using save_product_offer."
-        )
-    finally:
-        close_browser()
-
-    print(f"      ✅ stores = {[s.name for s in artifacts.get('stores', [])]}")
-    print(f"      ✅ offers count = {len(artifacts.get('offers', []))}")
-
-    # ── 3. Evaluate ───────────────────────────────────────────
-    offers = artifacts.get("offers", [])
-    if not offers:
-        artifacts["best_deal"] = {"error": f"No offers found for '{item}' in '{region}'."}
-    else:
-        budget_note = f" within a max total budget of {max_budget} {currency}" if max_budget is not None else ""
-        print(f"\n[3/3] EvaluationAgent ← {len(offers)} offers, need qty={qty}{budget_note}")
-        eval_agent.run(
-            f"Evaluate the offers for '{item}' (quantity={qty}{budget_note}). "
-            "Call get_sorted_offers(), verify the cheapest matching offer, "
-            "and call select_best_deal(offer_index=..., reasoning=...) (or save_no_deal if none qualify)."
-        )
-    print(f"      ✅ best_deal = {artifacts['best_deal']}")
-
-    # ── Result ────────────────────────────────────────────────
+def _print_results(item: str, qty: int, currency: str) -> None:
+    """Print the winning BestDeal and the top 5 offers summary."""
     print("\n" + "=" * 55)
     print("🎯  RESULT")
     print("=" * 55)
-    deal = artifacts["best_deal"]
+    deal = artifacts.get("best_deal")
     if isinstance(deal, BestDeal):
         print(f"🏆  Best deal for {qty}x {deal.matched_item}:")
         print(f"    Store : {deal.store}")
@@ -97,9 +59,7 @@ def run(user_input: str):
     else:
         print("❌  No deal selected.")
 
-    _print_top_deals(offers, qty=qty, default_currency=currency, limit=5)
-
-    return artifacts
+    _print_top_deals(artifacts.get("offers", []), qty=qty, default_currency=currency, limit=5)
 
 
 def _print_top_deals(offers: list, qty: int = 1, default_currency: str = "LKR", limit: int = 5) -> None:
@@ -141,8 +101,131 @@ def _print_top_deals(offers: list, qty: int = 1, default_currency: str = "LKR", 
         print(f"   Link  : {d['url']}")
 
 
+def run_turn(user_input: str):
+    """Run one conversational turn using the Python Diff-Router to skip redundant steps."""
+    old_intent = artifacts.get("intent") if isinstance(artifacts.get("intent"), UserIntent) else None
+
+    print("\n" + "=" * 55)
+    print("🤖  SmolDealz Pipeline")
+    print("=" * 55)
+
+    # ── 1. Parse intent (context-aware on follow-ups) ─────────
+    print(f"\n[1/3] IntentFinderAgent ← '{user_input}'")
+    if old_intent is not None:
+        intent_prompt = (
+            f"Previous intent: {old_intent.model_dump()}. "
+            f"New user message: '{user_input}'. "
+            "Treat this as a follow-up update if it modifies quantity, budget, item, or region; "
+            "preserve unchanged fields from Previous intent, then call save_intent once."
+        )
+    else:
+        intent_prompt = (
+            f"Parse this request and save the intent: '{user_input}'. "
+            "Ask a clarifying question first if anything is ambiguous, then call save_intent once."
+        )
+    intent_agent.run(intent_prompt)
+    intent = artifacts.get("intent")
+    print(f"      ✅ intent = {intent}")
+
+    if not isinstance(intent, UserIntent):
+        print("❌  Could not parse a valid UserIntent.")
+        return artifacts
+
+    route = _decide_route(old_intent, intent)
+    print(f"      🔀 route = {route}")
+
+    # ── 2. Find items (skipped or store-reused per route) ─────
+    if route == "re_evaluate":
+        print("\n[2/3] ItemFinderAgent ⏭️  SKIPPED (same item & region; reusing existing offers)")
+        artifacts["best_deal"] = {}
+    else:
+        if route == "full_search":
+            artifacts["stores"] = []
+            clear_offers()
+            item_prompt = (
+                f"Find product listings and prices for '{intent.item}' in '{intent.region}'. "
+                "First call discover_stores, then search each store using the tiered protocol, "
+                "inspect product details, and save verified offers using save_product_offer."
+            )
+        else:  # search_same_stores
+            clear_offers()
+            store_names = [f"{s.name} ({s.url})" for s in artifacts.get("stores", [])]
+            item_prompt = (
+                f"Find product listings and prices for '{intent.item}' in '{intent.region}'. "
+                f"Stores are ALREADY discovered: {', '.join(store_names)}. "
+                "Do NOT call discover_stores — go straight to searching each store using the tiered protocol, "
+                "inspect product details, and save verified offers using save_product_offer."
+            )
+
+        print(f"\n[2/3] ItemFinderAgent ← item='{intent.item}', region='{intent.region}'")
+        try:
+            item_agent.run(item_prompt)
+        finally:
+            close_browser()
+
+    print(f"      ✅ stores = {[s.name for s in artifacts.get('stores', [])]}")
+    print(f"      ✅ offers count = {len(artifacts.get('offers', []))}")
+
+    # ── 3. Evaluate ───────────────────────────────────────────
+    offers = artifacts.get("offers", [])
+    if not offers:
+        artifacts["best_deal"] = {"error": f"No offers found for '{intent.item}' in '{intent.region}'."}
+    else:
+        budget_note = (
+            f" within a max total budget of {intent.max_budget} {intent.currency}"
+            if intent.max_budget is not None
+            else ""
+        )
+        print(f"\n[3/3] EvaluationAgent ← {len(offers)} offers, need qty={intent.quantity}{budget_note}")
+        eval_agent.run(
+            f"Evaluate the offers for '{intent.item}' (quantity={intent.quantity}{budget_note}). "
+            "Call get_sorted_offers(), verify the cheapest matching offer, "
+            "and call select_best_deal(offer_index=..., reasoning=...) (or save_no_deal if none qualify)."
+        )
+    print(f"      ✅ best_deal = {artifacts['best_deal']}")
+
+    _print_results(intent.item, intent.quantity, intent.currency)
+    return artifacts
+
+
+def run(user_input: str):
+    """Single-shot entrypoint (resets state, then runs one turn)."""
+    reset_artifacts()
+    return run_turn(user_input)
+
+
+def chat_loop(use_orchestrator: bool = False) -> None:
+    """Continuous interactive chat loop."""
+    reset_artifacts()
+    mode_label = "OrchestratorAgent" if use_orchestrator else "Diff-Router"
+    print(f"\n💬 SmolDealz Chat ({mode_label}) — type 'exit' or 'quit' to stop.")
+
+    while True:
+        try:
+            user_input = input("\nYou: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nBye!")
+            break
+
+        if not user_input:
+            continue
+        if user_input.lower() in {"exit", "quit", "q"}:
+            print("Bye!")
+            break
+
+        if use_orchestrator:
+            try:
+                response = orchestrator_agent.run(user_input, reset=False)
+                print(f"\n🤖 {response}")
+            finally:
+                close_browser()
+            intent = artifacts.get("intent")
+            if isinstance(intent, UserIntent) and artifacts.get("offers"):
+                _print_results(intent.item, intent.quantity, intent.currency)
+        else:
+            run_turn(user_input)
+
+
 if __name__ == "__main__":
-    user_input = input("What are you looking for? ").strip()
-    if not user_input:
-        user_input = "I need 3 mg90 servo motors in Sri Lanka under Rs. 3500"
-    run(user_input)
+    use_orch = "--orchestrator" in sys.argv
+    chat_loop(use_orchestrator=use_orch)

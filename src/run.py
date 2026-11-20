@@ -11,7 +11,7 @@ load_dotenv()
 from src.state import artifacts, clear_offers, reset_artifacts
 from src.schemas import BestDeal, UserIntent
 from src.agents.intent_agent import intent_agent
-from src.agents.item_agent import item_agent, close_browser
+from src.agents.item_agent import item_agent, close_browser, search_all_stores_parallel
 from src.agents.eval_agent import eval_agent
 from src.agents.orchestrator_agent import orchestrator_agent
 
@@ -45,6 +45,8 @@ def _print_results(item: str, qty: int, currency: str) -> None:
         print(f"    Total : {currency} {deal.total_price}")
         print(f"    Stock : {deal.stock}")
         print(f"    Link  : {deal.url}")
+        if deal.screenshot_path:
+            print(f"    Proof : {deal.screenshot_path}")
         if deal.reasoning:
             print(f"    Why   : {deal.reasoning}")
     elif isinstance(deal, dict) and "error" in deal:
@@ -56,6 +58,8 @@ def _print_results(item: str, qty: int, currency: str) -> None:
         print(f"    Total : {currency} {deal.get('total_price')}")
         print(f"    Stock : {deal.get('stock')}")
         print(f"    Link  : {deal.get('url')}")
+        if deal.get("screenshot_path"):
+            print(f"    Proof : {deal.get('screenshot_path')}")
     else:
         print("❌  No deal selected.")
 
@@ -71,6 +75,8 @@ def _print_top_deals(offers: list, qty: int = 1, default_currency: str = "LKR", 
             continue
         in_stock = o.in_stock if hasattr(o, "in_stock") else o.get("in_stock", True)
         stock_qty = o.stock_quantity if hasattr(o, "stock_quantity") else o.get("stock_quantity")
+        screenshot_path = o.screenshot_path if hasattr(o, "screenshot_path") else o.get("screenshot_path")
+        price_source = o.price_source if hasattr(o, "price_source") else o.get("price_source")
         priced.append({
             "store": o.store if hasattr(o, "store") else o.get("store", ""),
             "title": o.title if hasattr(o, "title") else o.get("title", ""),
@@ -80,6 +86,8 @@ def _print_top_deals(offers: list, qty: int = 1, default_currency: str = "LKR", 
             "in_stock": in_stock,
             "stock_qty": stock_qty,
             "url": o.url if hasattr(o, "url") else o.get("url", ""),
+            "screenshot_path": screenshot_path,
+            "price_source": price_source,
         })
 
     if not priced:
@@ -96,9 +104,12 @@ def _print_top_deals(offers: list, qty: int = 1, default_currency: str = "LKR", 
             f"In Stock ({d['stock_qty']})" if d["in_stock"] and d["stock_qty"] is not None
             else ("In Stock" if d["in_stock"] else "Out of Stock")
         )
+        src_label = f" [{d['price_source']}]" if d.get("price_source") else ""
         print(f"{rank}. [{d['store']}] {d['title']}")
-        print(f"   Price : {d['currency']} {d['unit_price']} each | Total: {d['currency']} {d['total_price']} | {stock_label}")
+        print(f"   Price : {d['currency']} {d['unit_price']} each | Total: {d['currency']} {d['total_price']} | {stock_label}{src_label}")
         print(f"   Link  : {d['url']}")
+        if d.get("screenshot_path"):
+            print(f"   Proof : {d['screenshot_path']}")
 
 
 def run_turn(user_input: str):
@@ -136,30 +147,21 @@ def run_turn(user_input: str):
 
     # ── 2. Find items (skipped or store-reused per route) ─────
     if route == "re_evaluate":
-        print("\n[2/3] ItemFinderAgent ⏭️  SKIPPED (same item & region; reusing existing offers)")
+        print("\n[2/3] ParallelScraper ⏭️  SKIPPED (same item & region; reusing existing offers)")
         artifacts["best_deal"] = {}
     else:
-        if route == "full_search":
+        force_refresh = route == "full_search"
+        if force_refresh:
             artifacts["stores"] = []
-            clear_offers()
-            item_prompt = (
-                f"Find product listings and prices for '{intent.item}' in '{intent.region}'. "
-                "First call discover_stores, then search each store using the tiered protocol, "
-                "inspect product details, and save verified offers using save_product_offer."
-            )
-        else:  # search_same_stores
-            clear_offers()
-            store_names = [f"{s.name} ({s.url})" for s in artifacts.get("stores", [])]
-            item_prompt = (
-                f"Find product listings and prices for '{intent.item}' in '{intent.region}'. "
-                f"Stores are ALREADY discovered: {', '.join(store_names)}. "
-                "Do NOT call discover_stores — go straight to searching each store using the tiered protocol, "
-                "inspect product details, and save verified offers using save_product_offer."
-            )
+        clear_offers()
 
-        print(f"\n[2/3] ItemFinderAgent ← item='{intent.item}', region='{intent.region}'")
+        print(f"\n[2/3] ParallelScraper ← item='{intent.item}', region='{intent.region}', force_refresh={force_refresh}")
         try:
-            item_agent.run(item_prompt)
+            search_all_stores_parallel(
+                item=intent.item,
+                region=intent.region,
+                force_refresh=force_refresh,
+            )
         finally:
             close_browser()
 

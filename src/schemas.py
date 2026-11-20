@@ -28,6 +28,8 @@ class ProductOffer(BaseModel):
     url: str = Field(description="Direct URL to the product page")
     snippet: Optional[str] = Field(default=None, description="Brief description or specs extracted by the scraper")
     matched_item: Optional[str] = Field(default=None, description="Original search query this offer was found for")
+    screenshot_path: Optional[str] = Field(default=None, description="Path to the annotated visual proof screenshot PNG")
+    price_source: Optional[str] = Field(default=None, description="Which tier/method extracted the price (e.g. 'json-ld', 'llm-text', 'llm-vision')")
 
 
 class BestDeal(BaseModel):
@@ -38,3 +40,4 @@ class BestDeal(BaseModel):
     stock: Optional[int | str] = Field(default="In Stock", description="Stock available at the winning store")
     url: str = Field(description="Link to purchase")
     reasoning: Optional[str] = Field(default=None, description="Why this deal was selected")
+    screenshot_path: Optional[str] = Field(default=None, description="Path to the winning offer's annotated proof screenshot")

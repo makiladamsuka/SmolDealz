@@ -105,6 +105,7 @@ def select_best_deal(offer_index: int, reasoning: str = "") -> str:
         )
 
     stock_qty = o.stock_quantity if hasattr(o, "stock_quantity") else o.get("stock_quantity")
+    screenshot_path = o.screenshot_path if hasattr(o, "screenshot_path") else o.get("screenshot_path")
     try:
         deal = BestDeal(
             matched_item=o.title if hasattr(o, "title") else o.get("title", item),
@@ -114,6 +115,7 @@ def select_best_deal(offer_index: int, reasoning: str = "") -> str:
             stock=stock_qty if stock_qty is not None else "In Stock",
             url=o.url if hasattr(o, "url") else o["url"],
             reasoning=reasoning or None,
+            screenshot_path=screenshot_path,
         )
         artifacts["best_deal"] = deal
         return (
